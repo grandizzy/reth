@@ -11,16 +11,19 @@ use crate::{
     evm::{BalIndexReader, BbBlockExecutorFactory, BbEvmPlan},
     BigBlockMap,
 };
-use alloy_consensus::Header;
-use alloy_evm::eth::EthBlockExecutionCtx;
+use alloy_consensus::{Header, TransactionEnvelope};
+use alloy_evm::{
+    block::{BlockExecutor, BlockExecutorFor},
+    eth::{EthBlockExecutionCtx, EthTxResult},
+};
 use alloy_primitives::B256;
 use alloy_rpc_types::engine::ExecutionData;
 use core::convert::Infallible;
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_ethereum_forks::Hardforks;
-use reth_ethereum_primitives::EthPrimitives;
+use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{
-    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, ExecutableTxIterator,
+    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, ExecutableTxIterator, HaltReasonFor,
     NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig, RethReceiptBuilder};
@@ -119,6 +122,8 @@ where
     C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,
 {
     type Primitives = EthPrimitives;
+    type TxExecutionResult =
+        EthTxResult<HaltReasonFor<Self>, <TransactionSigned as TransactionEnvelope>::TxType>;
     type Error = Infallible;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
     type BlockExecutorFactory = BbBlockExecutorFactory<Arc<C>>;
@@ -190,6 +195,23 @@ where
             Some(seed_state_block_hashes::<DB>),
             bal_index_reader,
         )
+    }
+
+    fn sendable_executor_for_block<'a, DB: Database>(
+        &'a self,
+        db: &'a mut revm::database::State<DB>,
+        block: &'a SealedBlock<reth_ethereum_primitives::Block>,
+    ) -> Result<
+        impl BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut revm::database::State<DB>>
+            + BlockExecutor<Result = Self::TxExecutionResult>,
+        Self::Error,
+    > {
+        // Big-block payloads don't carry a BAL, so the BAL execute path — which is the only
+        // caller of this method — should never dispatch here. A plan-less `BbBlockExecutor`
+        // degrades to single-segment behaviour, which is a harmless fallback if it ever does.
+        let evm = self.evm_for_block(db, block.header())?;
+        let ctx = self.context_for_block(block)?;
+        Ok(self.executor_factory.create_executor_with_seeder(evm, ctx, None))
     }
 }
 
