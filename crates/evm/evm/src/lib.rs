@@ -21,7 +21,7 @@ use crate::execute::{BasicBlockBuilder, Executor};
 use alloc::vec::Vec;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::{
-    block::{BlockExecutorFactory, BlockExecutorFor},
+    block::{BlockExecutor, BlockExecutorFactory, BlockExecutorFor, TxResult},
     precompiles::PrecompilesMap,
 };
 use alloy_primitives::{Address, Bytes, B256};
@@ -182,6 +182,9 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     /// The primitives type used by the EVM.
     type Primitives: NodePrimitives;
 
+    /// Result type returned by `execute_transaction_without_commit`.
+    type TxExecutionResult: TxResult<HaltReason = HaltReasonFor<Self>> + Send;
+
     /// The error type that is returned by [`Self::next_evm_env`].
     type Error: Error + Send + Sync + 'static;
 
@@ -331,6 +334,18 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         let ctx = self.context_for_block(block)?;
         Ok(self.create_executor(evm, ctx))
     }
+
+    /// Creates a strategy for execution of a given block whose tx result can be sent to worker
+    /// threads.
+    fn sendable_executor_for_block<'a, DB: Database>(
+        &'a self,
+        db: &'a mut State<DB>,
+        block: &'a SealedBlock<<Self::Primitives as NodePrimitives>::Block>,
+    ) -> Result<
+        impl BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>>
+            + BlockExecutor<Result = Self::TxExecutionResult>,
+        Self::Error,
+    >;
 
     /// Creates a [`BlockBuilder`]. Should be used when building a new block.
     ///
