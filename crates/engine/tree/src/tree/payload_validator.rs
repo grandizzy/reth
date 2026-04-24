@@ -1093,12 +1093,10 @@ where
 
         // Use the header's BAL hash when present. Synthetic payloads supplied via an OOB
         // BAL side channel (e.g. reth-bench big blocks) don't commit to a BAL in the
-        // header, so we fall back to keccak256 of the OOB BAL bytes. Check A in
-        // `bal::validation::check_bal_hash` becomes tautological in that case; the final
-        // post-execution rebuild check in `BalPayloadExecutor::execute_block` still
-        // guards against a bad OOB BAL.
-        let header_bal_hash =
-            block.header().block_access_list_hash().unwrap_or_else(|| decoded_bal.hash());
+        // header, so there's nothing to anchor either Check A (entry hash) or Check F
+        // (post-execution rebuild) against — `BalPayloadExecutor` skips both when this is
+        // `None`. Receipt-root and state-root checks downstream still gate correctness.
+        let header_bal_hash = block.header().block_access_list_hash();
 
         // Build the snapshot. Per-thread providers via the builder; writes through to the cache.
         let cache = handle.caches().ok_or_else(|| {

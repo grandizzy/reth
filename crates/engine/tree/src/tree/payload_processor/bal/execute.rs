@@ -119,7 +119,7 @@ impl<Evm: ConfigureEvm> BalPayloadExecutor<Evm> {
         received_bal: Arc<DecodedBal>,
         block: &SealedBlock<BlockTy<Evm::Primitives>>,
         txs: Vec<Tx>,
-        header_bal_hash: B256,
+        header_bal_hash: Option<B256>,
         block_gas_limit: u64,
     ) -> Result<BalExecutionOutput<Evm>, BalExecutionError>
     where
@@ -137,6 +137,12 @@ impl<Evm: ConfigureEvm> BalPayloadExecutor<Evm> {
     }
 
     /// Executes one block on the BAL path using the provided worker pool.
+    ///
+    /// `header_bal_hash` is `None` when the payload header has no
+    /// `block_access_list_hash` commitment (e.g. big-block payloads served via OOB BAL).
+    /// In that case both the entry hash check (A) and the post-execution rebuild check (F)
+    /// are skipped — there is nothing in the header to anchor them against, and the
+    /// receipt-root and state-root checks downstream still gate correctness.
     #[expect(clippy::too_many_arguments)]
     pub fn execute_block_in_pool<Tx>(
         &self,
@@ -145,13 +151,15 @@ impl<Evm: ConfigureEvm> BalPayloadExecutor<Evm> {
         received_bal: Arc<DecodedBal>,
         block: &SealedBlock<BlockTy<Evm::Primitives>>,
         txs: Vec<Tx>,
-        header_bal_hash: B256,
+        header_bal_hash: Option<B256>,
         block_gas_limit: u64,
     ) -> Result<BalExecutionOutput<Evm>, BalExecutionError>
     where
         Tx: ExecutableTxFor<Evm> + Send,
     {
-        check_bal_hash(&received_bal, header_bal_hash)?;
+        if let Some(expected) = header_bal_hash {
+            check_bal_hash(&received_bal, expected)?;
+        }
         let bal = received_bal.as_bal();
         check_item_count(bal, block_gas_limit)?;
 
@@ -251,12 +259,14 @@ impl<Evm: ConfigureEvm> BalPayloadExecutor<Evm> {
         };
 
         let composed_alloy = canonical_state.take_built_alloy_bal().expect("with_bal_builder set");
-        let rebuilt = compute_block_access_list_hash(&composed_alloy);
-        if rebuilt != header_bal_hash {
-            return Err(BalExecutionError::Reject(RejectReason::FinalHashMismatch {
-                rebuilt,
-                expected: header_bal_hash,
-            }));
+        if let Some(expected) = header_bal_hash {
+            let rebuilt = compute_block_access_list_hash(&composed_alloy);
+            if rebuilt != expected {
+                return Err(BalExecutionError::Reject(RejectReason::FinalHashMismatch {
+                    rebuilt,
+                    expected,
+                }));
+            }
         }
 
         canonical_state.merge_transitions(BundleRetention::Reverts);
@@ -417,7 +427,7 @@ mod tests {
             to_arc_decoded(received_bal),
             &block,
             Vec::new(),
-            wrong_hash,
+            Some(wrong_hash),
             30_000_000,
         );
 
@@ -453,7 +463,7 @@ mod tests {
             to_arc_decoded(received_bal),
             &block,
             Vec::new(),
-            bal_hash,
+            Some(bal_hash),
             10_000,
         );
 
@@ -512,7 +522,7 @@ mod tests {
             to_arc_decoded(received_bal),
             &block,
             Vec::new(),
-            bal_hash,
+            Some(bal_hash),
             30_000_000,
         );
 
@@ -722,7 +732,7 @@ mod tests {
             to_arc_decoded(reference_bal),
             &block,
             vec![recovered1, recovered2],
-            bal_hash,
+            Some(bal_hash),
             30_000_000,
         );
 
@@ -822,7 +832,7 @@ mod tests {
                 to_arc_decoded(reference_bal),
                 &block,
                 txs,
-                bal_hash,
+                Some(bal_hash),
                 gas_limit,
             )
             .unwrap_or_else(|e| panic!("BAL path failed: {e:?}"));
@@ -1057,7 +1067,7 @@ mod tests {
             to_arc_decoded(received_bal),
             &block,
             Vec::new(),
-            empty_bal_hash,
+            Some(empty_bal_hash),
             30_000_000,
         );
 
