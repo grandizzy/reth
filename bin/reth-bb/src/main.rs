@@ -7,7 +7,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 mod evm;
 mod evm_config;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Bytes, B256};
 
 use alloy_rpc_types::engine::{ExecutionData, ForkchoiceState, ForkchoiceUpdated};
 use async_trait::async_trait;
@@ -51,6 +51,13 @@ use tracing::{info, trace};
 /// Shared map for big block data, keyed by payload hash.
 pub type BigBlockMap = Arc<Mutex<HashMap<B256, BigBlockData<ExecutionData>>>>;
 
+/// Shared map for out-of-band block access lists, keyed by payload hash.
+///
+/// Populated by the RPC handler when a client supplies BAL bytes alongside a payload, read
+/// by the EVM config during validation. Keeping BAL out-of-band lets the payload (and its
+/// block hash) stay stable across replay.
+pub type BalMap = Arc<Mutex<HashMap<B256, Bytes>>>;
+
 // ---------------------------------------------------------------------------
 // Custom RPC trait for big-block payloads
 // ---------------------------------------------------------------------------
@@ -58,7 +65,12 @@ pub type BigBlockMap = Arc<Mutex<HashMap<B256, BigBlockData<ExecutionData>>>>;
 /// Big-block extension of the `reth_` engine API.
 #[jsonrpsee::proc_macros::rpc(server, namespace = "reth")]
 pub trait BbRethEngineApi {
-    /// `reth_newPayload` with optional big-block data.
+    /// `reth_newPayload` with optional big-block data and out-of-band BAL.
+    ///
+    /// `block_access_list`, when supplied, is RLP-encoded BAL bytes used during validation
+    /// instead of any BAL embedded in the payload. This keeps the payload bytes (and block
+    /// hash) stable across replay, which matters for chained blocks where modifying the
+    /// parent's hash would perturb BLOCKHASH and EIP-2935 storage in children.
     #[method(name = "newPayload")]
     async fn reth_new_payload(
         &self,
@@ -66,6 +78,7 @@ pub trait BbRethEngineApi {
         wait_for_persistence: Option<bool>,
         wait_for_caches: Option<bool>,
         big_block_data: Option<BigBlockData<ExecutionData>>,
+        block_access_list: Option<Bytes>,
     ) -> RpcResult<RethPayloadStatus>;
 
     /// `reth_forkchoiceUpdated` – pass-through.
@@ -80,6 +93,7 @@ pub trait BbRethEngineApi {
 #[derive(Debug)]
 struct BbRethEngineApiHandler {
     pending: BigBlockMap,
+    bals: BalMap,
     engine: ConsensusEngineHandle<EthEngineTypes>,
 }
 
@@ -91,6 +105,7 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
         wait_for_persistence: Option<bool>,
         wait_for_caches: Option<bool>,
         big_block_data: Option<BigBlockData<ExecutionData>>,
+        block_access_list: Option<Bytes>,
     ) -> RpcResult<RethPayloadStatus> {
         let wait_for_persistence = wait_for_persistence.unwrap_or(true);
         let wait_for_caches = wait_for_caches.unwrap_or(true);
@@ -99,6 +114,7 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
             wait_for_persistence,
             wait_for_caches,
             has_big_block_data = big_block_data.is_some(),
+            has_oob_bal = block_access_list.is_some(),
             "Serving bb reth_newPayload"
         );
 
@@ -111,9 +127,12 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
             }
         };
 
+        let hash = ExecutionPayload::block_hash(&payload);
         if let Some(data) = big_block_data {
-            let hash = ExecutionPayload::block_hash(&payload);
             self.pending.lock().unwrap().insert(hash, data);
+        }
+        if let Some(bal) = block_access_list {
+            self.bals.lock().unwrap().insert(hash, bal);
         }
 
         let (status, timings) = self
@@ -121,6 +140,10 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
             .reth_new_payload(payload, wait_for_persistence, wait_for_caches)
             .await
             .map_err(EngineApiError::from)?;
+
+        // Drop any OOB BAL entry that the validator didn't consume (e.g. payload rejected
+        // before BAL extraction). Keeps the map from growing across requests.
+        self.bals.lock().unwrap().remove(&hash);
 
         Ok(RethPayloadStatus {
             status,
@@ -151,11 +174,12 @@ impl BbRethEngineApiServer for BbRethEngineApiHandler {
 #[derive(Debug)]
 pub struct BbAddOns {
     pending: BigBlockMap,
+    bals: BalMap,
 }
 
 impl BbAddOns {
-    const fn new(pending: BigBlockMap) -> Self {
-        Self { pending }
+    const fn new(pending: BigBlockMap, bals: BalMap) -> Self {
+        Self { pending, bals }
     }
 
     fn make_rpc_add_ons<N: FullNodeComponents>(
@@ -201,11 +225,12 @@ where
     async fn launch_add_ons(self, ctx: AddOnsContext<'_, N>) -> eyre::Result<Self::Handle> {
         let engine_handle = ctx.beacon_engine_handle.clone();
         let pending = self.pending.clone();
+        let bals = self.bals.clone();
         let rpc_add_ons = self.make_rpc_add_ons::<N>();
 
         rpc_add_ons
             .launch_add_ons_with(ctx, move |container| {
-                let handler = BbRethEngineApiHandler { pending, engine: engine_handle };
+                let handler = BbRethEngineApiHandler { pending, bals, engine: engine_handle };
                 let bb_module = BbRethEngineApiServer::into_rpc(handler);
                 container.auth_module.replace_auth_methods(bb_module.remove_context())?;
                 Ok(())
@@ -255,6 +280,7 @@ where
 #[derive(Debug)]
 pub struct BbExecutorBuilder {
     pending: BigBlockMap,
+    bals: BalMap,
 }
 
 impl<Node> ExecutorBuilder<Node> for BbExecutorBuilder
@@ -271,7 +297,7 @@ where
     type EVM = BbEvmConfig<<Node::Types as NodeTypes>::ChainSpec>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        Ok(BbEvmConfig::new(EthEvmConfig::new(ctx.chain_spec()), self.pending))
+        Ok(BbEvmConfig::new(EthEvmConfig::new(ctx.chain_spec()), self.pending, self.bals))
     }
 }
 
@@ -283,11 +309,12 @@ where
 #[derive(Debug, Clone)]
 pub struct BbNode {
     pending: BigBlockMap,
+    bals: BalMap,
 }
 
 impl BbNode {
-    const fn new(pending: BigBlockMap) -> Self {
-        Self { pending }
+    const fn new(pending: BigBlockMap, bals: BalMap) -> Self {
+        Self { pending, bals }
     }
 }
 
@@ -315,12 +342,12 @@ where
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
         EthereumNode::components()
-            .executor(BbExecutorBuilder { pending: self.pending.clone() })
+            .executor(BbExecutorBuilder { pending: self.pending.clone(), bals: self.bals.clone() })
             .consensus(BbConsensusBuilder)
     }
 
     fn add_ons(&self) -> Self::AddOns {
-        BbAddOns::new(self.pending.clone())
+        BbAddOns::new(self.pending.clone(), self.bals.clone())
     }
 }
 
@@ -355,10 +382,19 @@ fn main() {
     }
 
     let pending: BigBlockMap = Arc::new(Mutex::new(HashMap::new()));
+    let bals: BalMap = Arc::new(Mutex::new(HashMap::new()));
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _| {
         info!(target: "reth::cli", "Launching big block node");
-        let handle = builder.launch_node(BbNode::new(pending.clone())).await?;
+
+        // Force-enable the BAL execute path: reth-bb's reason for existing is to exercise
+        // that path on replayed big blocks. The flag isn't exposed via `EngineArgs`, so we
+        // build the standard engine launcher and flip the field before launching.
+        let node_builder = builder.node(BbNode::new(pending.clone(), bals.clone()));
+        let mut launcher = node_builder.engine_api_launcher();
+        launcher.engine_tree_config =
+            launcher.engine_tree_config.clone().with_bal_execute_path_enabled(true);
+        let handle = node_builder.launch_with(launcher).await?;
 
         handle.wait_for_node_exit().await
     }) {

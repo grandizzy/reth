@@ -9,14 +9,14 @@ pub(crate) use reth_engine_primitives::BigBlockData;
 
 use crate::{
     evm::{BalIndexReader, BbBlockExecutorFactory, BbEvmPlan},
-    BigBlockMap,
+    BalMap, BigBlockMap,
 };
 use alloy_consensus::{Header, TransactionEnvelope};
 use alloy_evm::{
     block::{BlockExecutor, BlockExecutorFor},
     eth::{EthBlockExecutionCtx, EthTxResult},
 };
-use alloy_primitives::B256;
+use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types::engine::ExecutionData;
 use core::convert::Infallible;
 use reth_chainspec::{ChainSpec, EthChainSpec};
@@ -68,6 +68,8 @@ pub struct BbEvmConfig<C = ChainSpec> {
     pub inner: EthEvmConfig<C>,
     /// Shared map of pending big-block metadata.
     pub pending: BigBlockMap,
+    /// Shared map of out-of-band BAL bytes, keyed by payload hash.
+    pub bals: BalMap,
     /// Block executor factory for big-block execution.
     executor_factory: BbBlockExecutorFactory<Arc<C>>,
     /// Block assembler.
@@ -76,7 +78,7 @@ pub struct BbEvmConfig<C = ChainSpec> {
 
 impl<C> BbEvmConfig<C> {
     /// Creates a new big-block EVM configuration.
-    pub fn new(inner: EthEvmConfig<C>, pending: BigBlockMap) -> Self
+    pub fn new(inner: EthEvmConfig<C>, pending: BigBlockMap, bals: BalMap) -> Self
     where
         C: Clone,
     {
@@ -88,7 +90,7 @@ impl<C> BbEvmConfig<C> {
         );
         let block_assembler = inner.block_assembler.clone();
 
-        Self { inner, pending, executor_factory, block_assembler }
+        Self { inner, pending, bals, executor_factory, block_assembler }
     }
 }
 
@@ -264,6 +266,11 @@ where
         payload: &ExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
         self.inner.tx_iterator_for_payload(payload)
+    }
+
+    fn oob_block_access_list(&self, payload: &ExecutionData) -> Option<Bytes> {
+        let hash = payload.block_hash();
+        self.bals.lock().unwrap().remove(&hash)
     }
 }
 

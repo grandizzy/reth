@@ -484,11 +484,24 @@ where
             .in_scope(|| self.evm_env_for(&input))
             .map_err(NewPayloadError::other)?;
 
-        // Extract the decoded BAL, if valid and available.
-        let decoded_bal = ensure_ok!(input
-            .try_decoded_access_list()
-            .map_err(|err| { Box::<dyn std::error::Error + Send + Sync>::from(err) }))
-        .map(Arc::new);
+        // Extract the decoded BAL. OOB BAL from `ConfigureEngineEvm::oob_block_access_list`
+        // takes precedence over the payload's inline BAL: it lets bench tooling keep the
+        // block hash stable by supplying BAL through a side channel instead of mutating
+        // the payload bytes.
+        let decoded_bal = {
+            let oob = match &input {
+                BlockOrPayload::Payload(payload) => self.evm_config.oob_block_access_list(payload),
+                BlockOrPayload::Block(_) => None,
+            };
+            let decoded = match oob {
+                Some(bytes) => Some(ensure_ok!(DecodedBal::from_rlp_bytes(bytes)
+                    .map_err(|err| { Box::<dyn std::error::Error + Send + Sync>::from(err) }))),
+                None => ensure_ok!(input
+                    .try_decoded_access_list()
+                    .map_err(|err| { Box::<dyn std::error::Error + Send + Sync>::from(err) })),
+            };
+            decoded.map(Arc::new)
+        };
 
         let env = ExecutionEnv {
             evm_env,
@@ -1078,12 +1091,14 @@ where
 
         debug!(target: "engine::tree::payload_validator", "Executing block via BAL path");
 
-        // Header must carry the BAL hash on the BAL execute path.
-        let header_bal_hash = block.header().block_access_list_hash().ok_or_else(|| {
-            InsertBlockErrorKind::Other(
-                "BAL execute path: header missing block_access_list_hash".into(),
-            )
-        })?;
+        // Use the header's BAL hash when present. Synthetic payloads supplied via an OOB
+        // BAL side channel (e.g. reth-bench big blocks) don't commit to a BAL in the
+        // header, so we fall back to keccak256 of the OOB BAL bytes. Check A in
+        // `bal::validation::check_bal_hash` becomes tautological in that case; the final
+        // post-execution rebuild check in `BalPayloadExecutor::execute_block` still
+        // guards against a bad OOB BAL.
+        let header_bal_hash =
+            block.header().block_access_list_hash().unwrap_or_else(|| decoded_bal.hash());
 
         // Build the snapshot. Per-thread providers via the builder; writes through to the cache.
         let cache = handle.caches().ok_or_else(|| {

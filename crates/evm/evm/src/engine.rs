@@ -1,6 +1,7 @@
 use crate::{execute::ExecutableTxFor, ConfigureEvm, EvmEnvFor, ExecutionCtxFor, TxEnvFor};
 use alloy_consensus::transaction::Either;
 use alloy_evm::{block::ExecutableTxParts, RecoveredTx};
+use alloy_primitives::Bytes;
 use rayon::prelude::*;
 use reth_primitives_traits::TxTy;
 
@@ -20,6 +21,18 @@ pub trait ConfigureEngineEvm<ExecutionData>: ConfigureEvm {
         &self,
         payload: &ExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error>;
+
+    /// Returns an out-of-band RLP-encoded block access list for the given payload, if one has
+    /// been supplied through a side channel (e.g. a bench extension of `reth_newPayload`).
+    ///
+    /// When `Some`, the engine uses these bytes instead of the payload's inline BAL field.
+    /// This lets replay/benchmark tooling keep the payload bytes (and therefore the block
+    /// hash) stable while still supplying the BAL needed by the BAL execute path.
+    ///
+    /// Default implementation returns `None`; production nodes read BAL from the payload.
+    fn oob_block_access_list(&self, _payload: &ExecutionData) -> Option<Bytes> {
+        None
+    }
 }
 
 /// Converts a raw transaction into an executable transaction.
