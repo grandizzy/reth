@@ -21,7 +21,7 @@ use crate::execute::{BasicBlockBuilder, Executor};
 use alloc::vec::Vec;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::{
-    block::{BlockExecutor, BlockExecutorFactory, BlockExecutorFor, TxResult},
+    block::{BlockExecutorFactory, BlockExecutorFor},
     precompiles::PrecompilesMap,
 };
 use alloy_primitives::{Address, Bytes, B256};
@@ -182,13 +182,6 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     /// The primitives type used by the EVM.
     type Primitives: NodePrimitives;
 
-    /// Per-transaction execution result produced by [`Self::executor_for_block`].
-    ///
-    /// Pinned as an associated type so the result is visible through the opaque return of
-    /// [`Self::executor_for_block`] (associated-type bounds on `impl Trait` returns don't
-    /// propagate to use sites).
-    type TxExecutionResult: TxResult<HaltReason = HaltReasonFor<Self>> + Send;
-
     /// The error type that is returned by [`Self::next_evm_env`].
     type Error: Error + Send + Sync + 'static;
 
@@ -201,6 +194,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     type BlockExecutorFactory: for<'a> BlockExecutorFactory<
         Transaction = TxTy<Self::Primitives>,
         Receipt = ReceiptTy<Self::Primitives>,
+        TxExecutionResult: Send,
         ExecutionCtx<'a>: Debug + Send,
         EvmFactory: EvmFactory<
             Tx: TransactionEnvMut
@@ -319,7 +313,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         &'a self,
         evm: EvmFor<Self, &'a mut State<DB>, I>,
         ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>
+    ) -> BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>
     where
         DB: Database,
         I: InspectorFor<Self, &'a mut State<DB>> + 'a,
@@ -332,11 +326,12 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         &'a self,
         db: &'a mut State<DB>,
         block: &'a SealedBlock<<Self::Primitives as NodePrimitives>::Block>,
-    ) -> Result<
-        impl BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>>
-            + BlockExecutor<Result = Self::TxExecutionResult>,
-        Self::Error,
-    >;
+    ) -> Result<BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>>, Self::Error>
+    {
+        let evm = self.evm_for_block(db, block.header())?;
+        let ctx = self.context_for_block(block)?;
+        Ok(self.create_executor(evm, ctx))
+    }
 
     /// Creates a [`BlockBuilder`]. Should be used when building a new block.
     ///
@@ -360,7 +355,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
     ) -> impl BlockBuilder<
         Primitives = Self::Primitives,
-        Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>,
+        Executor = BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>,
     >
     where
         DB: Database,
@@ -412,7 +407,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     ) -> Result<
         impl BlockBuilder<
             Primitives = Self::Primitives,
-            Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>>,
+            Executor = BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>>,
         >,
         Self::Error,
     > {

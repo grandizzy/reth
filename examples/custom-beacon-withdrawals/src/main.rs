@@ -5,11 +5,11 @@
 
 use alloy_eips::eip4895::Withdrawal;
 use alloy_evm::{
-    block::{BlockExecutorFactory, BlockExecutorFor, ExecutableTx, GasOutput},
+    block::{BlockExecutorFactory, ExecutableTx, GasOutput},
     eth::{EthBlockExecutionCtx, EthBlockExecutor, EthTxResult},
     precompiles::PrecompilesMap,
     revm::context::Block as _,
-    EthEvm, EthEvmFactory,
+    EthEvm, EthEvmFactory, EvmFactory,
 };
 use alloy_sol_types::{sol, SolCall};
 use reth_ethereum::{
@@ -94,6 +94,9 @@ impl BlockExecutorFactory for CustomEvmConfig {
     type ExecutionCtx<'a> = EthBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
+    type TxExecutionResult = EthTxResult<<EthEvmFactory as EvmFactory>::HaltReason, TxType>;
+    type Executor<'a, DB: StateDB, I: InspectorFor<Self, DB>> =
+        CustomBlockExecutor<'a, EthEvm<DB, I, PrecompilesMap>>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         self.inner.evm_factory()
@@ -103,10 +106,10 @@ impl BlockExecutorFactory for CustomEvmConfig {
         &'a self,
         evm: EthEvm<DB, I, PrecompilesMap>,
         ctx: EthBlockExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: StateDB + 'a,
-        I: InspectorFor<Self, DB> + 'a,
+        DB: StateDB,
+        I: InspectorFor<Self, DB>,
     {
         CustomBlockExecutor {
             inner: EthBlockExecutor::new(
@@ -121,7 +124,6 @@ impl BlockExecutorFactory for CustomEvmConfig {
 
 impl ConfigureEvm for CustomEvmConfig {
     type Primitives = <EthEvmConfig as ConfigureEvm>::Primitives;
-    type TxExecutionResult = <EthEvmConfig as ConfigureEvm>::TxExecutionResult;
     type Error = <EthEvmConfig as ConfigureEvm>::Error;
     type NextBlockEnvCtx = <EthEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
     type BlockExecutorFactory = Self;
@@ -160,34 +162,6 @@ impl ConfigureEvm for CustomEvmConfig {
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
         self.inner.context_for_next_block(parent, attributes)
-    }
-
-    fn executor_for_block<'a, DB: reth_ethereum::evm::primitives::Database>(
-        &'a self,
-        db: &'a mut reth_ethereum::evm::revm::State<DB>,
-        block: &'a SealedBlock<Block>,
-    ) -> Result<
-        impl BlockExecutorFor<
-                'a,
-                Self::BlockExecutorFactory,
-                &'a mut reth_ethereum::evm::revm::State<DB>,
-            > + BlockExecutor<Result = Self::TxExecutionResult>,
-        Self::Error,
-    > {
-        // Construct `CustomBlockExecutor` directly so the return type is concrete and the
-        // compiler can see `Result = EthTxResult<HaltReason, TxType>`. Going through
-        // `BlockExecutorFactory::create_executor` hides the concrete type behind an opaque
-        // `impl Trait` without a `Result` constraint, which would fail the trait bound here.
-        let evm = self.evm_for_block(db, block.header())?;
-        let ctx = self.context_for_block(block)?;
-        Ok(CustomBlockExecutor {
-            inner: EthBlockExecutor::new(
-                evm,
-                ctx,
-                self.inner.chain_spec(),
-                self.inner.executor_factory.receipt_builder(),
-            ),
-        })
     }
 }
 
@@ -240,10 +214,7 @@ where
         self.inner.execute_transaction_without_commit(tx)
     }
 
-    fn commit_transaction(
-        &mut self,
-        output: Self::Result,
-    ) -> Result<GasOutput, BlockExecutionError> {
+    fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
         self.inner.commit_transaction(output)
     }
 

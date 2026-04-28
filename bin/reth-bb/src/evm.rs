@@ -7,15 +7,16 @@
 //! `execute_transaction` to apply segment-boundary changes.
 
 use crate::evm_config::BigBlockSegment;
+use alloy_consensus::TransactionEnvelope;
 use alloy_eips::eip7685::Requests;
 use alloy_evm::{
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
-        BlockExecutorFor, ExecutableTx, GasOutput, OnStateHook, StateChangeSource, StateDB,
+        ExecutableTx, GasOutput, OnStateHook, StateChangeSource, StateDB,
     },
     eth::{EthBlockExecutionCtx, EthBlockExecutor, EthEvmContext, EthTxResult},
     precompiles::PrecompilesMap,
-    Database, EthEvm, EthEvmFactory, Evm, FromRecoveredTx, FromTxWithEncoded,
+    Database, EthEvm, EthEvmFactory, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded,
 };
 use alloy_primitives::B256;
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
@@ -75,6 +76,7 @@ impl BbEvmPlan {
             .collect()
     }
 
+    /// Returns the segment that contains the transaction at `tx_index`.
     pub(crate) fn segment_index_for_tx(&self, tx_index: usize) -> usize {
         self.segments.partition_point(|segment| segment.start_tx <= tx_index).saturating_sub(1)
     }
@@ -103,6 +105,12 @@ impl std::fmt::Debug for BbEvmPlan {
 pub(crate) type BlockHashSeeder<DB> = fn(&mut DB, &[(u64, B256)]);
 
 /// Function pointer that reads the BAL index from the DB.
+///
+/// Injected from `ConfigureEvm::create_executor` where the concrete
+/// `State<DB>` type is known. `BbBlockExecutor` calls this lazily on first
+/// use to decide which segment to start at: `0` means canonical execution
+/// from segment 0, `n > 0` means a BAL worker that runs only the n-th
+/// transaction (in whichever segment contains it).
 pub(crate) type BalIndexReader<DB> = fn(&DB) -> u64;
 
 /// Block executor that wraps [`EthBlockExecutor`] and handles segment-boundary
@@ -116,7 +124,8 @@ pub(crate) type BalIndexReader<DB> = fn(&DB) -> u64;
 /// Gas counters reset at each boundary so that each segment's real gas limit
 /// is used (preserving correct GASLIMIT opcode behavior). Accumulated offsets
 /// are applied to receipts and totals in `finish()`.
-pub(crate) struct BbBlockExecutor<'a, DB, I, P, Spec>
+#[expect(missing_debug_implementations)]
+pub struct BbBlockExecutor<'a, DB, I, P, Spec>
 where
     DB: Database,
 {
@@ -139,9 +148,10 @@ where
     /// Callback to reseed block hashes into the DB's cache at segment
     /// boundaries. See [`BlockHashSeeder`].
     block_hash_seeder: Option<BlockHashSeeder<DB>>,
-    /// Callback to read the BAL index from the DB.
+    /// Callback to read `bal_index` from the DB. See [`BalIndexReader`].
     bal_index_reader: Option<BalIndexReader<DB>>,
-    /// Whether the executor has selected its starting segment.
+    /// Whether [`Self::initialize`] has run. Init swaps the inner executor's
+    /// env/ctx to the starting segment selected via `bal_index_reader`.
     initialized: bool,
 }
 
@@ -184,34 +194,40 @@ where
         }
     }
 
+    /// Idempotent first-use init. Reads `bal_index` from the DB to pick the
+    /// starting segment, swaps the inner executor's env/ctx to that segment,
+    /// and reseeds the block hash cache for its window.
+    ///
+    /// `bal_index == 0` selects segment 0 — canonical execution that walks
+    /// all segments via `maybe_apply_boundary`. `bal_index > 0` selects the
+    /// segment containing the `(bal_index - 1)`-th transaction and drops the
+    /// plan so segment boundaries don't fire — a BAL worker only runs one
+    /// transaction in its segment.
     fn initialize(&mut self) -> Result<(), BlockExecutionError> {
         if self.initialized {
             return Ok(());
         }
+        self.initialized = true;
 
         let plan = match &self.plan {
-            Some(plan) => plan,
+            Some(p) => p,
             None => return Ok(()),
         };
 
-        self.initialized = true;
-
         let bal_index =
             self.bal_index_reader.map(|reader| reader(self.inner().evm().db())).unwrap_or(0);
-        let segment_idx =
-            if bal_index == 0 { 0 } else { plan.segment_index_for_tx((bal_index - 1) as usize) };
+        let segment_idx = if bal_index == 0 {
+            0
+        } else {
+            let tx_index = (bal_index - 1) as usize;
+            plan.segment_index_for_tx(tx_index)
+        };
         let segment = &plan.segments[segment_idx];
-
-        // Swap the EVM's block_env and executor ctx to the selected segment's
-        // values so that EIP-2935/EIP-4788 system calls use the correct block
-        // number and parent hash. Without this, the outer big block header's
-        // block_number (which is synthetic) would be used, writing to wrong
-        // EIP-2935 slots and corrupting state.
         let block_env = segment.evm_env.block_env.clone();
         let block_number = block_env.number.saturating_to::<u64>();
         let mut cfg_env = segment.evm_env.cfg_env.clone();
         cfg_env.disable_base_fee = true;
-        let ctx = EthBlockExecutionCtx {
+        let segment_ctx = EthBlockExecutionCtx {
             parent_hash: segment.ctx.parent_hash,
             parent_beacon_block_root: segment.ctx.parent_beacon_block_root,
             ommers: segment.ctx.ommers,
@@ -225,7 +241,7 @@ where
         let evm_ctx = inner.evm.ctx_mut();
         evm_ctx.block = block_env;
         evm_ctx.cfg = cfg_env;
-        inner.ctx = ctx;
+        inner.ctx = segment_ctx;
 
         self.reseed_block_hashes_for(block_number);
 
@@ -416,8 +432,11 @@ where
     type Result = EthTxResult<HaltReason, alloy_consensus::TxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        // The outer big-block header uses a synthetic block number, so start
-        // system calls must run against the selected real segment env.
+        // Init swaps the EVM's block_env and executor ctx to the starting
+        // segment's values so the EIP-2935/EIP-4788 system calls use the
+        // correct block number and parent hash. Without this the outer big
+        // block header's (synthetic) block_number would be used, writing to
+        // wrong EIP-2935 slots and corrupting state.
         self.initialize()?;
         self.inner_mut().apply_pre_execution_changes()
     }
@@ -431,12 +450,19 @@ where
         self.inner_mut().execute_transaction_without_commit(tx)
     }
 
-    fn commit_transaction(
-        &mut self,
-        output: Self::Result,
-    ) -> Result<GasOutput, BlockExecutionError> {
-        self.maybe_apply_boundary()?;
-        let gas_used = self.inner_mut().commit_transaction(output)?;
+    fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
+        // Apply any pending segment boundary BEFORE committing this tx. Each segment boundary
+        // runs `inner.finish()` for the just-completed segment (post-execution system calls,
+        // withdrawals) and `apply_pre_execution_changes` for the new segment (EIP-2935 history
+        // storage, EIP-4788 beacon roots). Without this, BEACON_ROOTS / HISTORY_STORAGE only
+        // reflect the FIRST sub-block's writes and subsequent sub-blocks' state lookups (e.g.
+        // EIP-4788 timestamp-keyed reads) miss values that mainnet had — causing divergent
+        // execution downstream that surfaces as `SlotNotFound`. Pre-bump this was wired in via
+        // `commit_transaction`'s Result return; the new alloy-evm trait returns `GasOutput`
+        // unconditionally, so a boundary-apply failure here aborts via expect.
+        self.maybe_apply_boundary().expect("segment boundary apply failed");
+
+        let gas_used = self.inner_mut().commit_transaction(output);
 
         // Fix up cumulative_gas_used on the just-committed receipt so that
         // the receipt root task (which reads receipts incrementally) sees
@@ -451,7 +477,7 @@ where
         if let Some(plan) = &mut self.plan {
             plan.tx_counter += 1;
         }
-        Ok(gas_used)
+        gas_used
     }
 
     fn finish(
@@ -542,7 +568,7 @@ pub struct BbBlockExecutorFactory<Spec> {
     receipt_builder: RethReceiptBuilder,
     spec: Spec,
     evm_factory: EthEvmFactory,
-    /// Staged plan cloned into each [`BbBlockExecutor`].
+    /// Staged plan consumed by the next [`BbBlockExecutor`].
     pub(crate) staged_plan: Arc<Mutex<Option<BbEvmPlan>>>,
 }
 
@@ -575,6 +601,10 @@ impl<Spec> BbBlockExecutorFactory<Spec> {
         *self.staged_plan.lock().unwrap() = None;
     }
 
+    /// Returns a clone of the currently staged plan without consuming it.
+    ///
+    /// Cloning lets multiple executors (canonical + N parallel BAL workers
+    /// for the same block) each own their own plan state.
     fn peek_plan(&self) -> Option<BbEvmPlan> {
         self.staged_plan.lock().unwrap().clone()
     }
@@ -613,6 +643,12 @@ where
     type ExecutionCtx<'a> = EthBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
+    type TxExecutionResult = EthTxResult<
+        <EthEvmFactory as EvmFactory>::HaltReason,
+        <TransactionSigned as TransactionEnvelope>::TxType,
+    >;
+    type Executor<'a, DB: StateDB, I: Inspector<EthEvmContext<DB>>> =
+        BbBlockExecutor<'a, DB, I, PrecompilesMap, &'a Spec>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
@@ -622,10 +658,10 @@ where
         &'a self,
         evm: EthEvm<DB, I, PrecompilesMap>,
         ctx: EthBlockExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: StateDB + 'a,
-        I: Inspector<EthEvmContext<DB>> + 'a,
+        DB: StateDB,
+        I: Inspector<EthEvmContext<DB>>,
     {
         let plan = self.peek_plan();
         BbBlockExecutor::new(evm, ctx, &self.spec, self.receipt_builder, plan, None, None)
